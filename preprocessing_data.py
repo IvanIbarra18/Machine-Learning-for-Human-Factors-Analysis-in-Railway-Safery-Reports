@@ -85,7 +85,6 @@ def to_number(series):
     # Use the first successful conversion, in order: ranges, hours:minutes, plain number.
     return ranges.astype(float).fillna(hours_minutes).fillna(plain).astype("float64")
 
-
 # Build the table the model learns from. 
 # Each row is a report, each column is a feature. The label column is added later.
 # Many fields repeat once per person in the report.
@@ -123,6 +122,37 @@ def build_features(df):
     return X.loc[:, X.nunique(dropna=True) > 1]
 
 
+# The answers: one 0/1 column per event type (1 = event happened, 0 = not).
+def make_labels(df):
+    return pd.DataFrame({k: df[v].notna().astype(int) for k, v in TARGETS.items()})
+
+# All of a report's narratives joined into one text.
+# Only used to keep duplicate reports together when splitting.
+def narrative_text(df):
+    cols = [c for c in df.columns if c.startswith("Person Narrative / ")]
+    return (df[cols].astype("string").fillna("")
+            .apply(lambda s: s.str.strip()).agg(" ".join, axis=1).str.strip())
+
+# Split the reports: 70% training, 15% validation, 15% test.
+# Both preprocessing_data.py and run_baselines.py use this, so every model is trained and tested on exactly the same reports.
+def make_split(Y, narrative, seed=42):
+    # Give every unique narrative a group number.
+    grp = narrative.factorize()[0]
+
+    # Describe each report's events as a code.
+    # Very rare codes are grouped as "rare" so the split doesn't fail on them.
+    key = Y.astype(str).agg("".join, axis=1)
+    key = key.where(key.map(key.value_counts()) >= 30, "rare")
+
+    # Split the groups (NOT single reports).
+    g = pd.DataFrame({"g": grp, "k": key}).drop_duplicates("g")
+    g_tr, g_rest = train_test_split(g, test_size=0.30, stratify=g.k, random_state=seed)
+    g_va, g_te = train_test_split(g_rest, test_size=0.50, stratify=g_rest.k, random_state=seed)
+
+    # Turn the chosen groups back into row numbers.
+    rows = lambda part: np.where(np.isin(grp, part.g.values))[0]
+    return rows(g_tr), rows(g_va), rows(g_te)
+
 def main():
     #   --raw     the CSV file (default: DATA_PATH from .env)
     #   --target  which event category becomes the yes/no "label" column
@@ -152,16 +182,16 @@ def main():
     X = build_features(df)
     X.columns = [c.lower() for c in X.columns]
     X["label"] = df[TARGETS[a.target]].notna().astype(int)
-
-    # Split into 70% training, 15% validation, 15% test.
-    train, rest = train_test_split(X, test_size=0.30, stratify=X["label"], random_state=42)
-    val, test = train_test_split(rest, test_size=0.50, stratify=rest["label"], random_state=42)
+    
+    # Split the reports the same way run_baselines.py does
+    # so the neural network and the RQ1 models use the same training/validation/test reports.
+    tr, va, te = make_split(make_labels(df), narrative_text(df))
+    train, val, test = X.iloc[tr], X.iloc[va], X.iloc[te]
 
     out.mkdir(parents=True, exist_ok=True)
     for name, part in [("training", train), ("validation", val), ("test", test)]:
         part.to_csv(out / f"A_{name}.csv", index=False)
-        print(f"{out / f'A_{name}.csv'}: {len(part):,} rows, "
-              f"{part.shape[1] - 1} features, label=1 in {part['label'].mean():.1%}")
+        print(f"{out / f'A_{name}.csv'}: {len(part):,} rows, " f"{part.shape[1] - 1} features, label=1 in {part['label'].mean():.1%}")
     print(f"Target: {a.target}")
 
 
