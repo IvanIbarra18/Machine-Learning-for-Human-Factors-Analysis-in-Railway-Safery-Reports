@@ -1,0 +1,10 @@
+nbformat
+gdown
+pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+ipython
+ipykernel
+python-dotenv
