@@ -1,0 +1,35 @@
+{
+  "title": "Machine Learning for Human Factors Analysis in Railway Safety Reports",
+  "course": "CSCI 6379, Dr. Dongchul Kim, The University of Texas Rio Grande Valley",
+  "team": ["Samantha Ocana", "Andrea Garza", "Jesus Ivan Ibarra"],
+  "summary": "We are classifying six kinds of events in NASA’s railway close-call reports, using coded fields about people, conditions and operations, plus the reporters’ own words.",
+  "slides": {"file": "Deep_Learning_Presentation_1.pptx", "label": "Download slides"},
+  "done": [
+    {"title": "Proposal and research questions"},
+    {"title": "Literature review", "detail": "Seven studies on railway safety reports and close calls."},
+    {"title": "Dataset obtained", "detail": "All NASA C3RS close-call reports from the CRAFT export."},
+    {"title": "Data exploration", "detail": "Fields profiled, targets chosen, data quality checked."},
+    {"title": "Data cleaned and prepared", "detail": "Coded fields converted to model inputs, odd values fixed, and reports split into training (70%), validation (15%) and test (15%) sets."},
+    {"title": "RQ1: Model comparison on coded fields", "detail": "Logistic Regression, Random Forest and XGBoost trained and scored on all six event types."}
+  ],
+  "next": [
+    {"title": "RQ2: Does report text help?", "detail": "Add the narrative, synopsis and follow-up interviews as text features and compare.", "current": true},
+    {"title": "RQ3: Which factors matter most", "detail": "Measure how much each field and group of fields contributes."},
+    {"title": "Neural network on all six event types", "detail": "Extend our neural network from one event type to six."},
+    {"title": "Final paper and presentation"}
+  ],
+
+  "neural_network": {
+    "score": 0.92,
+    "description": "Our neural network’s validation score on its first run, predicting Station Operations only."
+  },
+
+  "research_questions": [
+    {"question": "To what extent can structured human-factor, environmental, personnel, and operational features classify the six recorded event categories?",
+    "status": "Done. {rq1_summary}"},
+    {"question": "Does adding report summaries, narratives, or callbacks improve event-category classification compared with structured features alone?",
+    "status": "In progress."},
+    {"question": "Which structured features are most informative for classifying the six recorded event categories?",
+    "status": "Not started."}
+  ]
+}
