@@ -410,7 +410,7 @@ window.SITE_DATA = {
   "next": [
    {
     "title": "RQ2: Does report text help?",
-    "detail": "Add the narrative, synopsis and follow-up interviews as text features and compare.",
+    "detail": "Add the narrative, synopsis and follow-up interviews using TF-IDF and a BERT transformer, and compare with coded fields alone.",
     "current": true
    },
    {

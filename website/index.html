@@ -168,7 +168,7 @@
 <body>
 
 <nav aria-label="Sections"><div class="wrap">
-  <a href="#data">Data</a><a href="#targets">Targets</a><a href="#people">Human factors</a><a href="#results">Results</a><a href="#progress">Progress</a><a href="#questions">Research questions</a>
+  <a href="#data">Data</a><a href="#targets">Targets</a><a href="#people">Human factors</a><a href="#results">Results</a>
   <a href="#progress">Progress</a><a href="#questions">Research questions</a>
   <a id="slides-link" class="nav-slides" hidden download>Download slides</a>
 </div></nav>
@@ -257,7 +257,7 @@
   $("course").textContent = P.course;
   $("title").textContent = P.title;
   $("summary").textContent = P.summary;
-  $("meta").innerHTML = "Team 12: " + P.team.map(t => `<strong>${esc(t)}</strong>`).join(", ") + ` · Updated ${esc(D.updated)}`;
+  $("meta").innerHTML = "Team 12: " + P.team.map(t => `<strong>${esc(t)}</strong>`).join(", ");
   const total = P.done.length + P.next.length;
   $("status-text").textContent = `${P.done.length} of ${total} milestones done`;
   $("meter").style.setProperty("--p", (P.done.length / total * 100) + "%");

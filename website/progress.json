@@ -13,7 +13,7 @@
     {"title": "RQ1: Model comparison on coded fields", "detail": "Logistic Regression, Random Forest and XGBoost trained and scored on all six event types."}
   ],
   "next": [
-    {"title": "RQ2: Does report text help?", "detail": "Add the narrative, synopsis and follow-up interviews as text features and compare.", "current": true},
+    {"title": "RQ2: Does report text help?", "detail": "Add the narrative, synopsis and follow-up interviews using TF-IDF and a BERT transformer, and compare with coded fields alone.", "current": true},
     {"title": "RQ3: Which factors matter most", "detail": "Measure how much each field and group of fields contributes."},
     {"title": "Neural network on all six event types", "detail": "Extend our neural network from one event type to six."},
     {"title": "Final paper and presentation"}
