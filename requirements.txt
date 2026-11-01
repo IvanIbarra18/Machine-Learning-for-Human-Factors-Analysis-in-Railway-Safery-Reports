@@ -1,10 +1,20 @@
-nbformat
-gdown
-pandas
+# Data and preprocessing
 numpy
+pandas
+python-dotenv
+scikit-learn
+scipy
+
+# Baseline models (scripts/run_baselines.py)
+xgboost
+
+# Neural network (train.py, eval.py)
+torch
+tqdm
+
+# Notebooks
 matplotlib
 seaborn
-scikit-learn
-ipython
+gdown
+nbformat
 ipykernel
-python-dotenv
