@@ -1,114 +1,68 @@
-# Machine Learning for Human Factors Analysis in Railway Safety Reports
+# C3RS tabular FT-Transformer
 
-This repository trains a fully connected neural network (MLP) for multiclass
-classification on tabular CSV data. It includes CSV loading, train-only feature
-preprocessing, model training, and validation metrics.
+Classify a recorded railway event using structured C3RS features only. This
+adapts the `rtdl_revisiting_models.FTTransformer` setup in your NBI
+`ft_transformer.ipynb`: separate continuous/categorical tensors, the library's
+default architecture and optimizer, and cross-entropy or optional focal loss.
+The NBI project is reference only and is not imported or modified.
 
-## Requirements
+## Setup and run
 
-- Python 3.10 or newer
-- pip
-- PyTorch, installed for your platform (CPU or CUDA)
+Install dependencies with `python -m pip install -r requirements.txt`.
 
-From the project root, create and activate a virtual environment in PowerShell:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install numpy pandas scikit-learn tqdm
-```
-
-Install PyTorch separately using the command recommended by the
-[official PyTorch installation selector](https://pytorch.org/get-started/locally/).
-The code uses CUDA when available and otherwise runs on CPU.
-
-## Dataset format
-
-The only dataset choice currently configured is `A`. Place its CSV partitions
-in `datasets/processed/A/` with these exact names:
-
-```text
-datasets/
-└── processed/
-    └── A/
-        ├── A_training.csv
-        ├── A_validation.csv
-        └── A_test.csv
-```
-
-Each CSV must have a header row, at least one feature column, and a target
-column named `label`. Column names are stripped of surrounding whitespace and
-normalized to lowercase when loaded. Each partition must contain data, and
-`label` cannot contain missing values. The training and validation feature
-columns must match in both names and order.
-
-Numeric and boolean features are median-imputed and standardized using
-Z-score scaling. Other feature columns are imputed with their most frequent
-value and one-hot encoded. Preprocessing is fitted only on the training
-partition and reused for validation.
-
-The repository currently includes small synthetic CSVs for trying the
-pipeline. Replace them with your own partitions when ready. The test partition
-can be loaded with `load_processed_split("A", "test")`; it is not used during
-the training or validation loop.
-
-## Train
-
-From the project root:
+Prepare one binary event target using the existing data preparation script:
 
 ```powershell
-python train.py --dataset A
+python preprocessing_data.py --target "Station Ops"
+python train.py --dataset A --output checkpoints/station_ops
 ```
 
-The default run uses 10 epochs, batch size 3, learning rate `0.0001`, SGD
-momentum `0.5`, seed 42, and FP32 precision. For a quicker smoke test:
+`preprocessing_data.py` reads the raw CSV configured by `DATA_PATH` in `.env`
+(or `--raw`). It preserves the existing narrative-grouped 70/15/15 split and
+excludes narratives, IDs, dates, event outcomes, and the listed leakage fields
+from model inputs. Narratives are used only for grouping duplicate reports.
+Other targets are listed by `python preprocessing_data.py --help`. Preparing
+another target replaces the processed A CSVs, so use a distinct checkpoint
+folder for each target.
+
+For the focal-loss option used in the NBI notebook:
 
 ```powershell
-python train.py --dataset A --epochs 1 --batch-size 128
+python train.py --dataset A --loss focal --output checkpoints/station_ops_focal
 ```
 
-Supported options:
+Defaults: 30 epochs, batch size 256, patience 8, seed 42, FP32. The model uses
+`FTTransformer.get_default_kwargs()` and `model.make_default_optimizer()`.
+`--precision FP16` or `BF16` enables mixed precision on CUDA.
 
-| Option | Default | Description |
-| --- | ---: | --- |
-| `--dataset` | Required | Dataset choice; currently only `A` |
-| `--epochs` | `10` | Number of training epochs |
-| `--batch-size`, `-b` | `3` | Samples per batch |
-| `--num-workers`, `-j` | `0` | DataLoader worker processes |
-| `--precision` | `FP32` | `FP32`, `FP16`, or `BF16`; AMP is used only on CUDA |
-| `--seed` | `42` | Random seed |
-| `--lr` | `0.0001` | SGD learning rate |
-| `--momentum` | `0.5` | SGD momentum |
-| `--output` | `checkpoints` | Reserved output directory argument |
+## Dataset adaptation
 
-Training prints loss and Macro-F1 for training and validation after each epoch.
-The current training script does not yet save model checkpoints.
+The three CSVs live in `datasets/processed/A/A_training.csv`,
+`A_validation.csv`, and `A_test.csv`, each with a `label` column.
+Counts, experience, visibility, and hours into shift are continuous inputs:
+median imputation and standardization are fitted on training only.
+Each remaining checkbox is its own categorical input, using the NBI notebook's
+`OrdinalEncoder` and +1 shift (zero is reserved for unknown categories).
+No one-hot expansion or temporal sequences are created. Time-of-day checkboxes
+are ordinary report attributes, not a history of observations.
 
-## Repository layout
+The current target is binary, so the classifier produces two logits rather
+than the ten NBI deck-rating logits. The six event categories can overlap;
+the current setup trains one yes/no classifier per chosen event, using the
+existing preparation workflow. BERT and text fusion are future work.
 
-```text
-data/
-  data_loading.py       CSV partition loading and label encoding
-  preprocessing.py      Imputation, categorical encoding, and Z-score scaling
-datasets/
-  raw/                  Source datasets
-  processed/A/          Processed training, validation, and test CSVs
-models/
-  MLP.py                Fully connected classifier
-utilis/
-  loss.py               Cross-entropy loss
-  metrics.py            Macro-F1 metric
-eval.py                 Validation loop and metrics
-train.py                CLI training entry point
-preprocessing_data.py   Placeholder for the one-time data preparation script
-```
+Validation Macro-F1 selects `best_ft_transformer.pt`. The output folder also
+contains `preprocessor.joblib` and `history.csv`. The checkpoint includes model
+settings, feature order, class names, and the best epoch. The test split is
+held out from training and model selection; this command does not report test
+performance. Unlike the NBI notebook, this uses the existing C3RS fixed
+partitions rather than bridge-grouped cross-validation.
 
-## Current limitations
+## Files
 
-- Only dataset choice `A` is enabled.
-- `preprocessing_data.py` is currently a placeholder; prepare the processed
-  CSV partitions separately.
-- Dataset files are excluded from Git by `.gitignore`, so add or copy them
-  locally before running the training command.
-- There is no standalone test evaluation command or checkpoint saving yet.
+- `train.py`: FT-Transformer training, early stopping, and checkpoint saving.
+- `eval.py`: validation for continuous/categorical input batches.
+- `data/`: existing CSV loading and FT input preprocessing.
+- `preprocessing_data.py`: existing C3RS feature, label, and split preparation.
+- `scripts/run_baselines.py`: existing baseline comparisons.
+- `notebooks/`: existing exploratory analysis and target review.

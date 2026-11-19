@@ -7,27 +7,30 @@ from pathlib import Path
 from torch.utils.data import TensorDataset, DataLoader
 from data.data_loading import AVAILABLE_DATASETS, encode_labels, load_train_validation
 from data.preprocessing import build_preprocessor
-from models.MLP import MLPClassifier
+from rtdl_revisiting_models import FTTransformer
+import joblib
+import pandas as pd
 from utilis.loss import ClassificationLoss
-from torch import optim
 from tqdm import tqdm
 from eval import evaluate
 from utilis.metrics import macro_f1
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Prepare settings for training")
-    parser.add_argument("--batch-size", "-b", type=int, default=3)
-    parser.add_argument('--epochs', type=int, default=10, metavar='N',help='number of epochs to train (default: 10)')
+    parser.add_argument("--batch-size", "-b", type=int, default=256)
+    parser.add_argument('--epochs', type=int, default=30, metavar='N',help='number of epochs to train (default: 30)')
     parser.add_argument("--num-workers", "-j", type=int, default=0)
     parser.add_argument("--precision",type=lambda value: value.upper(),choices=["FP32", "FP16", "BF16"],default="FP32",help="Requested training precision; AMP will be used in the training loop.",)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument('--lr', type=float, default=0.0001, metavar='LR',help='learning rate (default: 0.0001)')
-    parser.add_argument('--momentum', type=float, default=0.5, metavar='M',help='SGD momentum (default: 0.5)')
+    parser.add_argument('--patience', type=int, default=8)
+    parser.add_argument('--loss', choices=['ce', 'focal'], default='ce')
     parser.add_argument("--output",type=Path,default=Path("checkpoints"),help="Directory for saved model checkpoints.",)
     parser.add_argument("--dataset",type=str,choices=AVAILABLE_DATASETS,required=True,help="Processed CSV dataset to load.",)
 
     args = parser.parse_args()
 
+    if args.epochs < 1 or args.patience < 1:
+        parser.error("--epochs and --patience must be positive")
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
     if args.num_workers < 0:
@@ -67,8 +70,18 @@ def main():
     if not np.isfinite(X_val_processed).all():
         raise ValueError("Validation features contain NaN or infinity.")
 
-    # 3. Infer classes from the full dataset and encode target labels.
-    class_names = sorted(set(y_train) | set(y_validation))
+    # Keep the FT notebook's separate continuous and categorical inputs.
+    cont_slice = preprocessor.output_indices_["numeric"]
+    cat_slice = preprocessor.output_indices_["categorical"]
+    x_cont_train = X_train_processed[:, cont_slice]
+    x_cont_val = X_val_processed[:, cont_slice]
+    x_cat_train = X_train_processed[:, cat_slice].astype(np.int64) + 1
+    x_cat_val = X_val_processed[:, cat_slice].astype(np.int64) + 1
+    encoder = preprocessor.named_transformers_["categorical"]
+    cat_cardinalities = [len(c) + 1 for c in encoder.categories_]
+
+    # Classes are learned from training only; unexpected validation labels fail.
+    class_names = sorted(set(y_train))
     y_train_encoded = encode_labels(y_train, class_names)
     y_val_encoded = encode_labels(y_validation, class_names)
 
@@ -76,12 +89,14 @@ def main():
     y_val_encoded = y_val_encoded.astype(np.int64, copy=False)
 
     train_dataset = TensorDataset(
-        torch.from_numpy(X_train_processed),
+        torch.from_numpy(x_cont_train),
+        torch.from_numpy(x_cat_train),
         torch.from_numpy(y_train_encoded.copy()),
     )
 
     validation_dataset = TensorDataset(
-        torch.from_numpy(X_val_processed),
+        torch.from_numpy(x_cont_val),
+        torch.from_numpy(x_cat_val),
         torch.from_numpy(y_val_encoded.copy()),
     )
 
@@ -112,13 +127,16 @@ def main():
     )
 
     # 5. Initialize the model.
-    # Number of input features after preprocessing.
-    input_dim = X_train_processed.shape[1]
-
     # Number of target classes in the CSV.
     num_classes = len(class_names)
 
-    model = MLPClassifier(input_dim=input_dim,num_classes=num_classes,).to(device)
+    model_kwargs = FTTransformer.get_default_kwargs()
+    model = FTTransformer(
+        n_cont_features=x_cont_train.shape[1],
+        cat_cardinalities=cat_cardinalities,
+        d_out=num_classes,
+        **model_kwargs,
+    ).to(device)
 
     # Configure automatic mixed precision.
     use_amp = args.precision != "FP32" and device.type == "cuda"
@@ -127,30 +145,20 @@ def main():
 
     scaler = torch.amp.GradScaler("cuda",enabled=use_amp and amp_dtype == torch.float16,)
 
-    # Count model parameters.
-    total_params = sum(
-        parameter.numel()
-        for parameter in model.parameters()
-    )
-
-    trainable_params = sum(
-        parameter.numel()
-        for parameter in model.parameters()
-        if parameter.requires_grad
-    )
-
     # 6. Initialize the loss function.
     criterion = ClassificationLoss()
+    if args.loss == "focal":
+        from torch_focalloss import MultiClassFocalLoss
+        criterion = MultiClassFocalLoss(gamma=2.0, reduction="mean")
 
     # 7. Initialize the optimizer.
-    optimizer = optim.SGD(model.parameters(),lr=args.lr,momentum=args.momentum,)
+    optimizer = model.make_default_optimizer()
 
-    # Alternative optimizer: Adam
-    # optimizer = optim.Adam(model.parameters(),lr=args.lr,)
 
     # 8. Print run configuration.
     print(f"Dataset: {args.dataset}")
-    print("Feature columns: all columns except 'label'")
+    print(f"FT-Transformer: {x_cont_train.shape[1]} numeric, {x_cat_train.shape[1]} categorical features")
+    print(f"Loss: {args.loss}; optimizer: model.make_default_optimizer()")
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(validation_dataset)}")
     print(f"Batch size: {args.batch_size}")
@@ -160,6 +168,11 @@ def main():
     print(f"DataLoader workers: {args.num_workers}; pin_memory={pin_memory}")
     print(f"Training batches per epoch: {len(train_loader)}")
     print(f"Validation batches per epoch: {len(val_loader)}")
+
+    args.output.mkdir(parents=True, exist_ok=True)
+    best_f1, best_epoch = -1.0, 0
+    history = []
+    joblib.dump(preprocessor, args.output / "preprocessor.joblib")
 
     # 9. Training loop.
     for epoch in range(1, args.epochs + 1):
@@ -173,16 +186,17 @@ def main():
         epoch_start = time.perf_counter()
 
         with tqdm(total=len(train_dataset),desc=f"Epoch {epoch}/{args.epochs}",unit="sample",dynamic_ncols=True,) as pbar:
-            for features, targets in train_loader:
+            for x_cont, x_cat, targets in train_loader:
 
-                features = features.to(device, non_blocking=pin_memory)
+                x_cont = x_cont.to(device, non_blocking=pin_memory)
+                x_cat = x_cat.to(device, non_blocking=pin_memory)
                 targets = targets.to(device, non_blocking=pin_memory)
 
                 optimizer.zero_grad(set_to_none=True)
 
                 # Forward pass.
                 with torch.autocast(device_type=device.type,dtype=amp_dtype,enabled=use_amp,):
-                    logits = model(features)
+                    logits = model(x_cont, x_cat)
 
                 # Calculate loss in FP32 for numerical stability.
                 loss = criterion(logits.float(), targets)
@@ -233,6 +247,23 @@ def main():
         avg_val_loss = val_metrics["loss"]
         val_macro_f1 = val_metrics["macro_f1"]
 
+        history.append(dict(epoch=epoch, train_loss=avg_train_loss,
+                            train_macro_f1=train_macro_f1, val_loss=avg_val_loss,
+                            val_macro_f1=val_macro_f1))
+        pd.DataFrame(history).to_csv(args.output / "history.csv", index=False)
+        if val_macro_f1 > best_f1:
+            best_f1, best_epoch = val_macro_f1, epoch
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "model_kwargs": model_kwargs,
+                "n_cont_features": x_cont_train.shape[1],
+                "cat_cardinalities": cat_cardinalities,
+                "class_names": class_names,
+                "feature_columns": X_train.columns.tolist(),
+                "epoch": epoch, "val_macro_f1": best_f1,
+                "loss": args.loss,
+            }, args.output / "best_ft_transformer.pt")
+
         print(
             f"Epoch {epoch}/{args.epochs} complete | "
             f"Train Loss: {avg_train_loss:.4f} | "
@@ -240,6 +271,11 @@ def main():
             f"Validation Loss: {avg_val_loss:.4f} | "
             f"Validation Macro F1: {val_macro_f1:.4f}\n"
         )
+
+        if epoch - best_epoch >= args.patience:
+            print(f"Early stopping; best epoch {best_epoch}, Macro F1 {best_f1:.4f}")
+            break
+    print(f"Best checkpoint: {args.output / 'best_ft_transformer.pt'}")
 
 if __name__ == "__main__":
     main()

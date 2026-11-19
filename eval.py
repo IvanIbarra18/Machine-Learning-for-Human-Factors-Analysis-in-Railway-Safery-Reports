@@ -21,13 +21,14 @@ def evaluate(model,dataloader,criterion,device,num_classes,use_amp=False,amp_dty
     start_time = time.perf_counter()
 
     with tqdm(total=len(dataloader.dataset),desc=desc,unit="sample",dynamic_ncols=True,) as pbar:
-        for features, targets in dataloader:
-            features = features.to(device, non_blocking=True)
+        for x_cont, x_cat, targets in dataloader:
+            x_cont = x_cont.to(device, non_blocking=True)
+            x_cat = x_cat.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
             # Forward pass with optional automatic mixed precision.
             with torch.autocast(device_type=device.type,dtype=amp_dtype,enabled=use_amp,):
-                logits = model(features)
+                logits = model(x_cont, x_cat)
 
             # Calculate loss in FP32 for numerical stability.
             loss = criterion(logits.float(), targets)

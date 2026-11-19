@@ -10,6 +10,9 @@ xgboost
 
 # Neural network (train.py, eval.py)
 torch
+rtdl_revisiting_models
+torch-focalloss
+joblib
 tqdm
 
 # Notebooks
