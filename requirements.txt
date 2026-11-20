@@ -3,7 +3,6 @@ numpy
 pandas
 python-dotenv
 scikit-learn
-scipy
 
 # Baseline models (scripts/run_baselines.py)
 xgboost
@@ -11,13 +10,10 @@ xgboost
 # Neural network (train.py, eval.py)
 torch
 rtdl_revisiting_models
-torch-focalloss
+pytorch-focalloss
 joblib
 tqdm
 
 # Notebooks
 matplotlib
-seaborn
-gdown
-nbformat
 ipykernel

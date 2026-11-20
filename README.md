@@ -65,4 +65,19 @@ partitions rather than bridge-grouped cross-validation.
 - `data/`: existing CSV loading and FT input preprocessing.
 - `preprocessing_data.py`: existing C3RS feature, label, and split preparation.
 - `scripts/run_baselines.py`: existing baseline comparisons.
-- `notebooks/`: existing exploratory analysis and target review.
+- `notebooks/fttransformer.ipynb`: the only notebook on this branch, an earlier
+  six-label FT-Transformer experiment. Its scores are not comparable with the
+  baselines: it keeps the leakage fields that `preprocessing_data.py` removes,
+  uses its own random split, and reports validation scores only.
+
+## Removed from this branch
+
+`models/MLP.py`, the seven EDA notebooks (`notebooks/01_load_data.ipynb`
+through `notebooks/07_event_targets.ipynb`), and
+`notebooks/C3RS_event_label_review.md` were deleted here. They still exist on
+`main`. Merging this branch as it stands would delete them there too, so
+restore them on this branch before it is merged into `main`:
+
+```powershell
+git checkout main -- models/MLP.py notebooks/0*.ipynb notebooks/C3RS_event_label_review.md
+```
