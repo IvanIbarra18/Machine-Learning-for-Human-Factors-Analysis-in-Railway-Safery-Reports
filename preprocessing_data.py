@@ -5,6 +5,7 @@
 # Store proocessed dataset in datasets/processed
 
 # Store processed csvs in the form of datasets/processed/ A_training.csv, A_validation.csv, A_test.csv
+# Each CSV holds the input features plus one "label: <event>" column for each of the six events.
 
 import argparse
 import os
@@ -15,6 +16,8 @@ import numpy as np
 import pandas as pd
 from dotenv import find_dotenv, load_dotenv
 from sklearn.model_selection import train_test_split
+
+from data.data_loading import LABEL_PREFIX
 
 ROOT = Path(__file__).resolve().parent
 NOTEBOOK_DIR = ROOT / "src"
@@ -61,13 +64,17 @@ def selected(x):
     return x is True or x == "True" or (isinstance(x, str) and x not in ("False", ""))
 
 # Turns a column of mixed number formats into plain numbers.
-# "3-5"  -> 4      (experience range)
-# "31+"  -> 35     (experience range)
-# "2:45" -> 2.75   (2 hours 45 minutes)
-# "7"    -> 7      (normal number)
-# blank  -> NaN    (missing)
+# "3-5"    -> 4      (experience range)
+# ="3-5"   -> 4      (same range, as the raw CSV stores it so Excel does not read it as a date)
+# "31+"    -> 35     (experience range)
+# "2:45"   -> 2.75   (2 hours 45 minutes)
+# "7"      -> 7      (normal number)
+# blank    -> NaN    (missing)
 def to_number(series):
     v = series.astype("string").str.strip()
+
+    # Unwrap the Excel text wrapper: ="6-10" -> 6-10
+    v = v.str.replace(r'^="(.*)"$', r"\1", regex=True)
 
     # Try 1: Is it an experience range? 
     # If so, replace it with the midpoint.
@@ -109,6 +116,11 @@ def build_features(df):
 
         if any(k in b for k in NUMERIC):
             feats[b] = to_number(first)
+
+            # A field with values where none can be read would be dropped below as "constant".
+            # Stop instead, so an unexpected format is noticed.
+            if first.notna().any() and feats[b].isna().all():
+                raise ValueError(f"No value in {slot[0]!r} could be read as a number.")
 
             if "Visibility" in b:
                 feats[b] = np.log1p(feats[b].clip(lower=0))
@@ -155,12 +167,10 @@ def make_split(Y, narrative, seed=42):
 
 def main():
     #   --raw     the CSV file (default: DATA_PATH from .env)
-    #   --target  which event category becomes the yes/no "label" column
     #   --out     where to save the three output files
     ap = argparse.ArgumentParser(description="Prepare the C3RS data for train.py")
     ap.add_argument("--raw", default=os.getenv("DATA_PATH"),
                     help="Raw CSV (default: DATA_PATH from .env, relative to src/)")
-    ap.add_argument("--target", default="Station Ops", choices=list(TARGETS))
     ap.add_argument("--out", default="datasets/processed/A",
                     help="Output folder, relative to the repo root")
     a = ap.parse_args()
@@ -178,21 +188,25 @@ def main():
     df.columns = [" ".join(str(c).split()) for c in df.columns]
 
     # Build the input table.
-    # Add the answer column "label": 1 = event happened, 0 = not.
+    # Add one answer column per event, named "label: <event>": 1 = event happened, 0 = not.
     X = build_features(df)
     X.columns = [c.lower() for c in X.columns]
-    X["label"] = df[TARGETS[a.target]].notna().astype(int)
-    
+    n_features = X.shape[1]
+    Y = make_labels(df)
+    for event in Y.columns:
+        X[LABEL_PREFIX + event] = Y[event]
+
     # Split the reports the same way run_baselines.py does
     # so the neural network and the RQ1 models use the same training/validation/test reports.
-    tr, va, te = make_split(make_labels(df), narrative_text(df))
+    tr, va, te = make_split(Y, narrative_text(df))
     train, val, test = X.iloc[tr], X.iloc[va], X.iloc[te]
 
     out.mkdir(parents=True, exist_ok=True)
     for name, part in [("training", train), ("validation", val), ("test", test)]:
         part.to_csv(out / f"A_{name}.csv", index=False)
-        print(f"{out / f'A_{name}.csv'}: {len(part):,} rows, " f"{part.shape[1] - 1} features, label=1 in {part['label'].mean():.1%}")
-    print(f"Target: {a.target}")
+        print(f"{out / f'A_{name}.csv'}: {len(part):,} rows, {n_features} features, {Y.shape[1]} labels")
+        for event in Y.columns:
+            print(f"    {event:22s} yes in {part[LABEL_PREFIX + event].mean():.1%}")
 
 
 if __name__ == "__main__":

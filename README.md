@@ -1,44 +1,103 @@
 # C3RS tabular FT-Transformer
 
-Classify a recorded railway event using structured C3RS features only. This
-adapts the `rtdl_revisiting_models.FTTransformer` setup in your NBI
-`ft_transformer.ipynb`: separate continuous/categorical tensors, the library's
-default architecture and optimizer, and cross-entropy or optional focal loss.
-The NBI project is reference only and is not imported or modified.
+Classify the six recorded railway event categories using structured C3RS
+features only. One `rtdl_revisiting_models.FTTransformer` predicts all six
+events at once. A report can have several events, so each event is its own
+yes/no output (multi-label), not one choice among six. This adapts the setup in
+your NBI `ft_transformer.ipynb`: separate continuous/categorical tensors and
+the library's default architecture and optimizer. The NBI project is reference
+only and is not imported or modified.
 
 ## Setup and run
 
 Install dependencies with `python -m pip install -r requirements.txt`.
 
-Prepare one binary event target using the existing data preparation script:
-
 ```powershell
-python preprocessing_data.py --target "Station Ops"
-python train.py --dataset A --output checkpoints/station_ops
+python preprocessing_data.py
+python scripts/run_baselines.py
+python train.py --dataset A
 ```
 
 `preprocessing_data.py` reads the raw CSV configured by `DATA_PATH` in `.env`
 (or `--raw`). It preserves the existing narrative-grouped 70/15/15 split and
 excludes narratives, IDs, dates, event outcomes, and the listed leakage fields
 from model inputs. Narratives are used only for grouping duplicate reports.
-Other targets are listed by `python preprocessing_data.py --help`. Preparing
-another target replaces the processed A CSVs, so use a distinct checkpoint
-folder for each target.
 
-For the focal-loss option used in the NBI notebook:
+`train.py` trains the model, then scores it on the test set. To train several
+models and average their probabilities, pass several seeds:
 
 ```powershell
-python train.py --dataset A --loss focal --output checkpoints/station_ops_focal
+python train.py --dataset A --seeds 42 43 44 45 46
 ```
 
-Defaults: 30 epochs, batch size 256, patience 8, seed 42, FP32. The model uses
-`FTTransformer.get_default_kwargs()` and `model.make_default_optimizer()`.
-`--precision FP16` or `BF16` enables mixed precision on CUDA.
+Defaults: up to 60 epochs, batch size 64, patience 8, seed 42, FP32. The model
+uses `FTTransformer.get_default_kwargs()` and `model.make_default_optimizer()`
+(AdamW, learning rate 1e-4). With that small learning rate the model needs
+roughly 1,600 to 2,600 optimizer steps to peak: in a five-seed run at batch
+size 64 the best epoch fell between 14 and 23. The earlier default of batch
+size 256 for 30 epochs stopped at about 870 steps. `--loss focal` switches from binary cross-entropy to binary focal
+loss. `--precision FP16` or `BF16` enables mixed precision on CUDA.
+
+## How every model is scored
+
+The baselines and the FT-Transformer are scored the same way, with shared code:
+
+- Same reports: `make_split` in `preprocessing_data.py` makes the split for
+  both the processed CSVs and `scripts/run_baselines.py`.
+- Model choices use validation only. The baselines pick their settings by
+  validation average precision (AP); `train.py` keeps the epoch with the best
+  validation mean AP over the six events.
+- Each event's yes/no cutoff is picked on validation, then applied to test
+  (`score_event` in `utilis/metrics.py`).
+- The test set is scored once per trained model: precision, recall, F1, and AP
+  for each event. "Average F1" is the mean of the six per-event F1 scores.
+
+## Results
+
+Every experiment has its own folder under `results/`, named for what it is,
+with one CSV per seed plus `summary.md`:
+
+```
+results/tabular_only/             FT-Transformer on the structured fields (train.py)
+    seed_42.csv ... seed_46.csv   each model's test scores per event
+    average.csv                   test scores of the averaged prediction (several seeds only)
+    summary.md                    the short tables
+    baselines/                    LogReg, RandomForest, XGBoost (scripts/run_baselines.py)
+        seed_42.csv, summary.md
+    notebook/                     the notebook's own run
+        seed_42.csv, summary.md
+```
+
+Results are never overwritten. If an experiment's folder already has results,
+the run writes to a new numbered folder (`results/tabular_only_2/`,
+`baselines_2/`, ...) and prints which one it used. Pick the name with
+`--experiment`, for example `python train.py --dataset A --experiment text_only`.
+
+Git keeps the `summary.md` files, so the result tables are backed up. The CSVs
+(`*.csv` is ignored) and the model checkpoints stay local.
+
+## Notebook
+
+`notebooks/fttransformer.ipynb` shows the same pipeline end to end with its
+outputs saved: the data and split, the three baselines, one FT-Transformer
+trained with seed 42 (loss per epoch and a training curve), the test scores of
+all four models side by side, a confusion matrix per event, and the five-seed
+summary read from the `train.py` result files. It imports the feature,
+split, input-preparation, and scoring code from this repo, so its numbers are
+comparable with `train.py` and the baselines. Choose *Run All* (about 8
+minutes on the GPU), then save. It writes its results to
+`results/tabular_only/notebook/`.
+
+The test set has 1,540 reports, with about 210 to 380 "yes" reports per event.
+Resampling a split of that size moves mean AP by about 0.014 (one standard
+deviation), so differences of a few hundredths between models are not
+meaningful.
 
 ## Dataset adaptation
 
 The three CSVs live in `datasets/processed/A/A_training.csv`,
-`A_validation.csv`, and `A_test.csv`, each with a `label` column.
+`A_validation.csv`, and `A_test.csv`. Each holds the input features plus six
+`label: <event>` columns (1 = the event was recorded, 0 = not).
 Counts, experience, visibility, and hours into shift are continuous inputs:
 median imputation and standardization are fitted on training only.
 Each remaining checkbox is its own categorical input, using the NBI notebook's
@@ -46,29 +105,32 @@ Each remaining checkbox is its own categorical input, using the NBI notebook's
 No one-hot expansion or temporal sequences are created. Time-of-day checkboxes
 are ordinary report attributes, not a history of observations.
 
-The current target is binary, so the classifier produces two logits rather
-than the ten NBI deck-rating logits. The six event categories can overlap;
-the current setup trains one yes/no classifier per chosen event, using the
-existing preparation workflow. BERT and text fusion are future work.
+The classifier produces six logits, one per event, trained with binary
+cross-entropy on each. BERT and text fusion are future work.
 
-Validation Macro-F1 selects `best_ft_transformer.pt`. The output folder also
-contains `preprocessor.joblib` and `history.csv`. The checkpoint includes model
-settings, feature order, class names, and the best epoch. The test split is
-held out from training and model selection; this command does not report test
-performance. Unlike the NBI notebook, this uses the existing C3RS fixed
-partitions rather than bridge-grouped cross-validation.
+Checkpoints go to `checkpoints/<experiment folder>/` unless `--output` names
+another folder. It contains one checkpoint (`ft_transformer_seed<seed>.pt`) and
+one `history_seed<seed>.csv` per seed, plus `preprocessor.joblib` and
+`thresholds.json` (the yes/no cutoff of each event). Each checkpoint includes
+model settings, feature order, event names, and the best epoch. Unlike the NBI
+notebook, this uses the existing C3RS fixed partitions rather than
+bridge-grouped cross-validation.
 
 ## Files
 
-- `train.py`: FT-Transformer training, early stopping, and checkpoint saving.
-- `eval.py`: validation for continuous/categorical input batches.
+- `train.py`: FT-Transformer training, early stopping, checkpoint saving, and
+  test scoring, for one seed or the average of several.
+- `eval.py`: loss, probabilities, and per-event AP for continuous/categorical
+  input batches.
+- `utilis/metrics.py`: cutoff selection and test scoring shared by `train.py`
+  and the baselines.
+- `utilis/results.py`: the results folder of an experiment (never overwritten)
+  and its `summary.md`.
 - `data/`: existing CSV loading and FT input preprocessing.
 - `preprocessing_data.py`: existing C3RS feature, label, and split preparation.
 - `scripts/run_baselines.py`: existing baseline comparisons.
-- `notebooks/fttransformer.ipynb`: the only notebook on this branch, an earlier
-  six-label FT-Transformer experiment. Its scores are not comparable with the
-  baselines: it keeps the leakage fields that `preprocessing_data.py` removes,
-  uses its own random split, and reports validation scores only.
+- `notebooks/fttransformer.ipynb`: the only notebook on this branch; see
+  *Notebook* above.
 
 ## Removed from this branch
 

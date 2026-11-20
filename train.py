@@ -1,11 +1,12 @@
 import argparse
+import json
 import numpy as np
 import torch
 import random
 import time
 from pathlib import Path
 from torch.utils.data import TensorDataset, DataLoader
-from data.data_loading import AVAILABLE_DATASETS, encode_labels, load_train_validation
+from data.data_loading import AVAILABLE_DATASETS, load_splits
 from data.preprocessing import build_preprocessor
 from rtdl_revisiting_models import FTTransformer
 import joblib
@@ -13,18 +14,21 @@ import pandas as pd
 from utilis.loss import ClassificationLoss
 from tqdm import tqdm
 from eval import evaluate
-from utilis.metrics import macro_f1
+from utilis.metrics import score_event
+from utilis.results import RESULTS_DIR, new_results_dir, seeds_summary
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Prepare settings for training")
-    parser.add_argument("--batch-size", "-b", type=int, default=256)
-    parser.add_argument('--epochs', type=int, default=30, metavar='N',help='number of epochs to train (default: 30)')
+    parser = argparse.ArgumentParser(description="Train one FT-Transformer that predicts all six events, then score it on the test set")
+    parser.add_argument("--batch-size", "-b", type=int, default=64)
+    parser.add_argument('--epochs', type=int, default=60, metavar='N',help='maximum number of epochs to train (default: 60)')
     parser.add_argument("--num-workers", "-j", type=int, default=0)
     parser.add_argument("--precision",type=lambda value: value.upper(),choices=["FP32", "FP16", "BF16"],default="FP32",help="Requested training precision; AMP will be used in the training loop.",)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seeds", "--seed", dest="seeds", type=int, nargs="+", default=[42],help="One model is trained per seed. With several seeds their probabilities are averaged.",)
     parser.add_argument('--patience', type=int, default=8)
-    parser.add_argument('--loss', choices=['ce', 'focal'], default='ce')
-    parser.add_argument("--output",type=Path,default=Path("checkpoints"),help="Directory for saved model checkpoints.",)
+    parser.add_argument('--loss', choices=['bce', 'focal'], default='bce')
+    parser.add_argument("--experiment",type=str,default="tabular_only",help="Name of this experiment. Results go to results/<name>/, or to a new numbered folder if that one already has results.",)
+    parser.add_argument("--results-dir",type=Path,default=RESULTS_DIR,help="Folder that holds the experiment folders (default: results/).",)
+    parser.add_argument("--output",type=Path,default=None,help="Directory for saved model checkpoints (default: checkpoints/<experiment folder>).",)
     parser.add_argument("--dataset",type=str,choices=AVAILABLE_DATASETS,required=True,help="Processed CSV dataset to load.",)
 
     args = parser.parse_args()
@@ -35,74 +39,60 @@ def parse_args():
         parser.error("--batch-size must be positive")
     if args.num_workers < 0:
         parser.error("--num-workers cannot be negative")
+    if len(set(args.seeds)) != len(args.seeds):
+        parser.error("--seeds must all be different")
 
     return args
 
-def main():
-    args = parse_args()
 
-    # Set random seeds.
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+def build_datasets(parts):
+    """Fit the input preprocessing on training only, then turn every split into tensors.
 
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
-    # 1. Load training and validation splits.
-    X_train, y_train, X_validation, y_validation = load_train_validation(
-        dataset=args.dataset,
-    )
-
-    # 2. Build and apply the preprocessing pipeline.
-    preprocessor = build_preprocessor(X_train)
+    parts maps "training" / "validation" / "test" to (features, 0/1 label table).
+    Returns the fitted preprocessor, one TensorDataset per split (continuous
+    inputs, categorical inputs, labels) and the size of each categorical input.
+    """
+    X_train = parts["training"][0]
 
     # Fit only on training data to prevent data leakage.
-    X_train_processed = preprocessor.fit_transform(X_train)
-    X_val_processed = preprocessor.transform(X_validation)
-
-    X_train_processed = np.asarray(X_train_processed, dtype=np.float32)
-    X_val_processed = np.asarray(X_val_processed, dtype=np.float32)
-
-    if not np.isfinite(X_train_processed).all():
-        raise ValueError("Training features contain NaN or infinity.")
-
-    if not np.isfinite(X_val_processed).all():
-        raise ValueError("Validation features contain NaN or infinity.")
+    preprocessor = build_preprocessor(X_train)
+    preprocessor.fit(X_train)
 
     # Keep the FT notebook's separate continuous and categorical inputs.
     cont_slice = preprocessor.output_indices_["numeric"]
     cat_slice = preprocessor.output_indices_["categorical"]
-    x_cont_train = X_train_processed[:, cont_slice]
-    x_cont_val = X_val_processed[:, cont_slice]
-    x_cat_train = X_train_processed[:, cat_slice].astype(np.int64) + 1
-    x_cat_val = X_val_processed[:, cat_slice].astype(np.int64) + 1
     encoder = preprocessor.named_transformers_["categorical"]
     cat_cardinalities = [len(c) + 1 for c in encoder.categories_]
 
-    # Classes are learned from training only; unexpected validation labels fail.
-    class_names = sorted(set(y_train))
-    y_train_encoded = encode_labels(y_train, class_names)
-    y_val_encoded = encode_labels(y_validation, class_names)
+    datasets = {}
+    for split, (X, Y) in parts.items():
+        processed = np.asarray(preprocessor.transform(X), dtype=np.float32)
 
-    y_train_encoded = y_train_encoded.astype(np.int64, copy=False)
-    y_val_encoded = y_val_encoded.astype(np.int64, copy=False)
+        if not np.isfinite(processed).all():
+            raise ValueError(f"{split.capitalize()} features contain NaN or infinity.")
 
-    train_dataset = TensorDataset(
-        torch.from_numpy(x_cont_train),
-        torch.from_numpy(x_cat_train),
-        torch.from_numpy(y_train_encoded.copy()),
-    )
+        datasets[split] = TensorDataset(
+            torch.from_numpy(processed[:, cont_slice]),
+            torch.from_numpy(processed[:, cat_slice].astype(np.int64) + 1),
+            torch.from_numpy(Y.to_numpy(dtype=np.float32, copy=True)),
+        )
 
-    validation_dataset = TensorDataset(
-        torch.from_numpy(x_cont_val),
-        torch.from_numpy(x_cat_val),
-        torch.from_numpy(y_val_encoded.copy()),
-    )
+    return preprocessor, datasets, cat_cardinalities
 
-    # 4. Configure DataLoaders.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def train_one_seed(seed, args, device, datasets, n_cont_features, cat_cardinalities, label_names, feature_columns):
+    """Train one model, keep the epoch with the best validation mean AP, and
+    return that model's validation and test probabilities."""
+
+    # Set random seeds.
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # Configure DataLoaders.
     pin_memory = device.type == "cuda"
 
     loader_options = {
@@ -114,27 +104,16 @@ def main():
     if args.num_workers > 0:
         loader_options["persistent_workers"] = True
 
-    train_loader = DataLoader(
-        train_dataset,
-        shuffle=True,
-        **loader_options,
-    )
+    train_loader = DataLoader(datasets["training"], shuffle=True, **loader_options)
+    val_loader = DataLoader(datasets["validation"], shuffle=False, **loader_options)
+    test_loader = DataLoader(datasets["test"], shuffle=False, **loader_options)
 
-    val_loader = DataLoader(
-        validation_dataset,
-        shuffle=False,
-        **loader_options,
-    )
-
-    # 5. Initialize the model.
-    # Number of target classes in the CSV.
-    num_classes = len(class_names)
-
+    # Initialize the model: one output (logit) per event.
     model_kwargs = FTTransformer.get_default_kwargs()
     model = FTTransformer(
-        n_cont_features=x_cont_train.shape[1],
+        n_cont_features=n_cont_features,
         cat_cardinalities=cat_cardinalities,
-        d_out=num_classes,
+        d_out=len(label_names),
         **model_kwargs,
     ).to(device)
 
@@ -145,47 +124,31 @@ def main():
 
     scaler = torch.amp.GradScaler("cuda",enabled=use_amp and amp_dtype == torch.float16,)
 
-    # 6. Initialize the loss function.
+    # Initialize the loss function. Each event is its own yes/no question.
     criterion = ClassificationLoss()
     if args.loss == "focal":
-        from torch_focalloss import MultiClassFocalLoss
-        criterion = MultiClassFocalLoss(gamma=2.0, reduction="mean")
+        from torch_focalloss import BinaryFocalLoss
+        criterion = BinaryFocalLoss(gamma=2.0, reduction="mean")
 
-    # 7. Initialize the optimizer.
+    # Initialize the optimizer.
     optimizer = model.make_default_optimizer()
 
-
-    # 8. Print run configuration.
-    print(f"Dataset: {args.dataset}")
-    print(f"FT-Transformer: {x_cont_train.shape[1]} numeric, {x_cat_train.shape[1]} categorical features")
-    print(f"Loss: {args.loss}; optimizer: model.make_default_optimizer()")
-    print(f"Training samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(validation_dataset)}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Epochs: {args.epochs}")
-    print(f"Requested precision: {args.precision}")
-    print(f"Device: {device}")
-    print(f"DataLoader workers: {args.num_workers}; pin_memory={pin_memory}")
-    print(f"Training batches per epoch: {len(train_loader)}")
-    print(f"Validation batches per epoch: {len(val_loader)}")
-
-    args.output.mkdir(parents=True, exist_ok=True)
-    best_f1, best_epoch = -1.0, 0
+    checkpoint_path = args.output / f"ft_transformer_seed{seed}.pt"
+    best_ap, best_epoch = -1.0, 0
+    best_state, best_val_probabilities = None, None
     history = []
-    joblib.dump(preprocessor, args.output / "preprocessor.joblib")
 
-    # 9. Training loop.
+    # Training loop.
     for epoch in range(1, args.epochs + 1):
         model.train()
 
         train_loss_sum = 0.0
         train_samples_seen = 0
-        train_targets = []
-        train_predictions = []
 
         epoch_start = time.perf_counter()
 
-        with tqdm(total=len(train_dataset),desc=f"Epoch {epoch}/{args.epochs}",unit="sample",dynamic_ncols=True,) as pbar:
+        # disable=None hides the bar when output is not a terminal (for example a log file).
+        with tqdm(total=len(train_loader.dataset),desc=f"Seed {seed} epoch {epoch}/{args.epochs}",unit="sample",dynamic_ncols=True,disable=None,) as pbar:
             for x_cont, x_cat, targets in train_loader:
 
                 x_cont = x_cont.to(device, non_blocking=pin_memory)
@@ -206,14 +169,10 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
 
-                batch_size = targets.size(0)   
+                batch_size = targets.size(0)
 
                 train_loss_sum += loss.item() * batch_size
-                train_samples_seen += batch_size   
-
-                predictions = logits.argmax(dim=1)
-                train_targets.extend(targets.detach().cpu().tolist())
-                train_predictions.extend(predictions.detach().cpu().tolist())
+                train_samples_seen += batch_size
 
                 elapsed = time.perf_counter() - epoch_start
                 samples_per_second = train_samples_seen / max(elapsed, 1e-9)
@@ -226,56 +185,165 @@ def main():
 
         avg_train_loss = train_loss_sum / train_samples_seen
 
-        train_macro_f1 = macro_f1(
-            y_true=train_targets,
-            y_pred=train_predictions,
-            num_classes=num_classes,
-        )
-
-        # 10. Validation is handled by eval.py.
+        # Validation is handled by eval.py.
         val_metrics = evaluate(
             model=model,
             dataloader=val_loader,
             criterion=criterion,
             device=device,
-            num_classes=num_classes,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
             desc=f"Validation {epoch}/{args.epochs}",
         )
 
-        avg_val_loss = val_metrics["loss"]
-        val_macro_f1 = val_metrics["macro_f1"]
+        val_mean_ap = val_metrics["mean_ap"]
 
         history.append(dict(epoch=epoch, train_loss=avg_train_loss,
-                            train_macro_f1=train_macro_f1, val_loss=avg_val_loss,
-                            val_macro_f1=val_macro_f1))
-        pd.DataFrame(history).to_csv(args.output / "history.csv", index=False)
-        if val_macro_f1 > best_f1:
-            best_f1, best_epoch = val_macro_f1, epoch
+                            val_loss=val_metrics["loss"], val_mean_ap=val_mean_ap,
+                            **{f"val_ap: {name}": ap for name, ap in zip(label_names, val_metrics["ap"])}))
+        pd.DataFrame(history).to_csv(args.output / f"history_seed{seed}.csv", index=False)
+
+        # Keep the epoch with the best validation mean AP (no cutoff needed, same measure the baselines select on).
+        if val_mean_ap > best_ap:
+            best_ap, best_epoch = val_mean_ap, epoch
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_val_probabilities = val_metrics["probabilities"]
             torch.save({
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": best_state,
                 "model_kwargs": model_kwargs,
-                "n_cont_features": x_cont_train.shape[1],
+                "n_cont_features": n_cont_features,
                 "cat_cardinalities": cat_cardinalities,
-                "class_names": class_names,
-                "feature_columns": X_train.columns.tolist(),
-                "epoch": epoch, "val_macro_f1": best_f1,
-                "loss": args.loss,
-            }, args.output / "best_ft_transformer.pt")
+                "label_names": label_names,
+                "feature_columns": feature_columns,
+                "epoch": epoch, "val_mean_ap": best_ap,
+                "loss": args.loss, "seed": seed,
+            }, checkpoint_path)
 
         print(
-            f"Epoch {epoch}/{args.epochs} complete | "
+            f"Seed {seed} epoch {epoch}/{args.epochs} complete | "
             f"Train Loss: {avg_train_loss:.4f} | "
-            f"Train Macro F1: {train_macro_f1:.4f} | "
-            f"Validation Loss: {avg_val_loss:.4f} | "
-            f"Validation Macro F1: {val_macro_f1:.4f}\n"
+            f"Validation Loss: {val_metrics['loss']:.4f} | "
+            f"Validation Mean AP: {val_mean_ap:.4f} | "
+            f"{time.perf_counter() - epoch_start:.0f}s",
+            flush=True,
         )
 
         if epoch - best_epoch >= args.patience:
-            print(f"Early stopping; best epoch {best_epoch}, Macro F1 {best_f1:.4f}")
+            print(f"Early stopping; best epoch {best_epoch}, validation mean AP {best_ap:.4f}")
             break
-    print(f"Best checkpoint: {args.output / 'best_ft_transformer.pt'}")
+
+    # The test set is used once per trained model, after its checkpoint was chosen on validation.
+    model.load_state_dict(best_state)
+    test_metrics = evaluate(
+        model=model,
+        dataloader=test_loader,
+        criterion=criterion,
+        device=device,
+        use_amp=use_amp,
+        amp_dtype=amp_dtype,
+        desc="Test",
+    )
+    print(f"Seed {seed} checkpoint: {checkpoint_path} (epoch {best_epoch}, validation mean AP {best_ap:.4f})\n", flush=True)
+
+    return best_val_probabilities, test_metrics["probabilities"], best_epoch
+
+
+def score_on_test(model_name, params, label_names, Y_val, P_val, Y_test, P_test):
+    """One row per event, in the same columns as scripts/run_baselines.py writes."""
+    return pd.DataFrame([
+        dict(setting="Structured", model=model_name, label=label, params=params,
+             **score_event(Y_val[:, j], P_val[:, j], Y_test[:, j], P_test[:, j]),
+             n_test=len(Y_test))
+        for j, label in enumerate(label_names)
+    ])
+
+
+def main():
+    args = parse_args()
+
+    # 1. Load the training, validation and test splits (each with one 0/1 column per event).
+    parts = load_splits(dataset=args.dataset)
+    X_train, Y_train = parts["training"]
+    label_names = Y_train.columns.tolist()
+
+    # 2. Build the preprocessing pipeline and the model inputs.
+    preprocessor, datasets, cat_cardinalities = build_datasets(parts)
+
+    n_cont_features = datasets["training"].tensors[0].shape[1]
+    n_cat_features = datasets["training"].tensors[1].shape[1]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 3. Print run configuration.
+    print(f"Dataset: {args.dataset}")
+    print(f"Events: {', '.join(label_names)}")
+    print(f"FT-Transformer: {n_cont_features} numeric, {n_cat_features} categorical features")
+    print(f"Loss: {args.loss}; optimizer: model.make_default_optimizer()")
+    print(f"Training / validation / test samples: {len(datasets['training'])} / {len(datasets['validation'])} / {len(datasets['test'])}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Epochs: up to {args.epochs}, patience {args.patience}")
+    print(f"Seeds: {args.seeds}")
+    print(f"Requested precision: {args.precision}")
+    print(f"Device: {device}\n", flush=True)
+
+    # 4. Results go to this experiment's own folder and are never overwritten:
+    # if results/<experiment>/ already has results, a new numbered folder is used.
+    # Checkpoints go to the folder of the same name under checkpoints/.
+    results_dir = new_results_dir(args.experiment, args.results_dir)
+    if args.output is None:
+        args.output = Path("checkpoints") / results_dir.relative_to(args.results_dir)
+    print(f"Results folder: {results_dir}")
+    print(f"Checkpoint folder: {args.output}\n", flush=True)
+
+    args.output.mkdir(parents=True, exist_ok=True)
+    joblib.dump(preprocessor, args.output / "preprocessor.joblib")
+
+    # 5. Train one model per seed. Each model is scored on the test set the same way
+    # scripts/run_baselines.py does (the yes/no cutoff of each event is picked on
+    # validation, then applied to test) and its scores are saved as soon as it is done.
+    Y_val = parts["validation"][1].to_numpy()
+    Y_test = parts["test"][1].to_numpy()
+
+    val_probabilities, test_probabilities, best_epochs, seed_results = [], [], [], []
+    for seed in args.seeds:
+        p_val, p_test, best_epoch = train_one_seed(
+            seed, args, device, datasets, n_cont_features, cat_cardinalities,
+            label_names, X_train.columns.tolist(),
+        )
+        val_probabilities.append(p_val)
+        test_probabilities.append(p_test)
+        best_epochs.append(best_epoch)
+
+        params = json.dumps(dict(seed=seed, best_epoch=best_epoch, loss=args.loss, batch_size=args.batch_size))
+        seed_results.append(score_on_test("FTTransformer", params, label_names, Y_val, p_val, Y_test, p_test))
+        seed_results[-1].to_csv(results_dir / f"seed_{seed}.csv", index=False)
+
+    # 6. With several seeds, the final prediction is the average probability over the models.
+    n_seeds = len(args.seeds)
+    final, average = seed_results[0], None
+    if n_seeds > 1:
+        params = json.dumps(dict(seeds=args.seeds, best_epochs=best_epochs, loss=args.loss, batch_size=args.batch_size))
+        average = score_on_test(f"FTTransformer ({n_seeds}-seed average)", params, label_names,
+                                Y_val, np.mean(val_probabilities, axis=0), Y_test, np.mean(test_probabilities, axis=0))
+        average.to_csv(results_dir / "average.csv", index=False)
+        final = average
+
+    with open(args.output / "thresholds.json", "w") as f:
+        json.dump(dict(model=final.model.iloc[0], seeds=args.seeds, thresholds=dict(zip(label_names, final.threshold))), f, indent=2)
+
+    # 7. The summary is a small markdown file, so it can be shared and kept in git.
+    summary = seeds_summary(
+        f"{results_dir.name}: FT-Transformer on the structured fields",
+        [f"One model per seed. Seeds {args.seeds}; best epoch per seed {best_epochs}; "
+         f"loss {args.loss}; batch size {args.batch_size}.",
+         f"Checkpoints: {args.output.as_posix()} (not in git). Written {time.strftime('%Y-%m-%d %H:%M')}."],
+        args.seeds, seed_results, average,
+    )
+    (results_dir / "summary.md").write_text(summary, encoding="utf-8")
+
+    print(summary)
+    print(f"Results: {results_dir}")
+    print(f"Summary to share: {results_dir / 'summary.md'}")
+    print(f"Checkpoints: {args.output}")
 
 if __name__ == "__main__":
     main()

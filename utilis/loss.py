@@ -2,16 +2,13 @@
 import torch.nn as nn
 
 class ClassificationLoss(nn.Module):
-    """Cross-entropy loss for multiclass classification."""
+    """Binary cross-entropy for multi-label classification: one yes/no per event."""
 
-    def __init__(self, weight=None, label_smoothing=0.0):
+    def __init__(self, pos_weight=None):
         super().__init__()
 
-        self.loss = nn.CrossEntropyLoss(
-            weight=weight,
-            label_smoothing=label_smoothing,
-        )
+        self.loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     def forward(self, logits, target):
 
-        return self.loss(logits, target.long())
+        return self.loss(logits, target.float())

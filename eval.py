@@ -1,26 +1,28 @@
 
-import time
-
+import numpy as np
 import torch
 from tqdm import tqdm
 
-from utilis.metrics import macro_f1
+from utilis.metrics import average_precision_per_event
 
 
 @torch.no_grad()
-def evaluate(model,dataloader,criterion,device,num_classes,use_amp=False,amp_dtype=torch.float32,desc="Validation",):
-    """Evaluate a multiclass classifier and return average loss and Macro-F1."""
+def evaluate(model,dataloader,criterion,device,use_amp=False,amp_dtype=torch.float32,desc="Validation",):
+    """Run a multi-label classifier over a DataLoader.
+
+    Returns the average loss, each event's probability for every report, the 0/1
+    targets, and average precision per event plus their mean.
+    """
 
     model.eval()
 
     total_loss = 0.0
     samples_seen = 0
     all_targets = []
-    all_predictions = []
+    all_probabilities = []
 
-    start_time = time.perf_counter()
-
-    with tqdm(total=len(dataloader.dataset),desc=desc,unit="sample",dynamic_ncols=True,) as pbar:
+    # disable=None hides the bar when output is not a terminal (for example a log file).
+    with tqdm(total=len(dataloader.dataset),desc=desc,unit="sample",dynamic_ncols=True,disable=None,) as pbar:
         for x_cont, x_cat, targets in dataloader:
             x_cont = x_cont.to(device, non_blocking=True)
             x_cat = x_cat.to(device, non_blocking=True)
@@ -31,40 +33,31 @@ def evaluate(model,dataloader,criterion,device,num_classes,use_amp=False,amp_dty
                 logits = model(x_cont, x_cat)
 
             # Calculate loss in FP32 for numerical stability.
-            loss = criterion(logits.float(), targets)
-
-            predictions = logits.argmax(dim=1)
+            logits = logits.float()
+            loss = criterion(logits, targets)
 
             batch_size = targets.size(0)
 
             total_loss += loss.item() * batch_size
             samples_seen += batch_size
 
-            all_targets.extend(targets.cpu().tolist())
-            all_predictions.extend(predictions.cpu().tolist())
-
-            elapsed = time.perf_counter() - start_time
-            samples_per_second = samples_seen / max(elapsed, 1e-9)
+            all_targets.append(targets.cpu())
+            all_probabilities.append(torch.sigmoid(logits).cpu())
 
             pbar.update(batch_size)
-            pbar.set_postfix(
-                loss=f"{loss.item():.4f}",
-                samples_s=f"{samples_per_second:.2f}",
-            )
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     if samples_seen == 0:
         raise ValueError("Cannot evaluate an empty DataLoader.")
 
-    avg_loss = total_loss / samples_seen
-
-    score = macro_f1(y_true=all_targets,y_pred=all_predictions,num_classes=num_classes,)
-
-    elapsed = time.perf_counter() - start_time
-    throughput = samples_seen / max(elapsed, 1e-9)
+    targets = torch.cat(all_targets).numpy().astype(int)
+    probabilities = torch.cat(all_probabilities).numpy()
+    ap = average_precision_per_event(targets, probabilities)
 
     return {
-        "loss": avg_loss,
-        "macro_f1": score,
-        "samples_per_second": throughput,
-        "elapsed_seconds": elapsed,
+        "loss": total_loss / samples_seen,
+        "probabilities": probabilities,
+        "targets": targets,
+        "ap": ap,
+        "mean_ap": float(np.mean(ap)),
     }
