@@ -21,6 +21,7 @@ data/processed/
 datasets/
 dataset/
 *.csv
+!results/split_acn.csv
 *.parquet
 *.pkl
 *.pickle

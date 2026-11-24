@@ -93,6 +93,28 @@ Resampling a split of that size moves mean AP by about 0.014 (one standard
 deviation), so differences of a few hundredths between models are not
 meaningful.
 
+## Text encoder comparison
+
+`scripts/compare_encoders.py` checks which frozen text encoder to build the
+text branch on, before any fine-tuning:
+
+```powershell
+python scripts/compare_encoders.py
+```
+
+For `bert-base-uncased`, `distilbert-base-uncased`, and `roberta-base` it joins
+each report's narratives, cuts the text to 512 tokens, averages the frozen
+encoder's token vectors into one vector per report, fits logistic regression
+per event on the training reports, and reports validation AP per event. It
+uses the shared split and never reads the test reports. About 5% of reports
+are longer than 512 tokens; `answerdotai/ModernBERT-base` (which reads longer
+texts) is added automatically only above 15%.
+
+The run takes about 15 minutes on the GPU the first time, including about 1 GB
+of model downloads. Results go to `results/encoder_comparison/`: one folder per
+model plus `summary.md` with the comparison. The report vectors are saved under
+`datasets/embeddings/` (not in git) and reused by later runs.
+
 ## Dataset adaptation
 
 The three CSVs live in `datasets/processed/A/A_training.csv`,

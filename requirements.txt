@@ -14,6 +14,9 @@ pytorch-focalloss
 joblib
 tqdm
 
+# Text encoders (scripts/compare_encoders.py)
+transformers
+
 # Notebooks
 matplotlib
 ipykernel
