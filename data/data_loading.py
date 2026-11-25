@@ -1,13 +1,13 @@
 from pathlib import Path
 from typing import Literal
 
-import numpy as np
 import pandas as pd
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 PROCESSED_DIR = PROJECT_DIR / "datasets" / "processed"
 AVAILABLE_DATASETS = ("A",)
-TARGET_COLUMN = "label"
+# Each event has its own 0/1 column in the processed CSVs, named "label: <event>".
+LABEL_PREFIX = "label: "
 SPLITS = ("training", "validation", "test")
 
 
@@ -32,53 +32,54 @@ def get_processed_dataset_path(
 def load_processed_split(
     dataset: str,
     split: Literal["training", "validation", "test"],
-) -> tuple[pd.DataFrame, pd.Series]:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return the features and the 0/1 label table (one column per event) of one split."""
     csv_path = get_processed_dataset_path(dataset, split)
     df = pd.read_csv(csv_path, low_memory=False)
-    df.columns = df.columns.str.strip().str.lower()
+    df.columns = df.columns.str.strip()
 
-    if df.columns.duplicated().any():
-        duplicates = df.columns[df.columns.duplicated()].tolist()
-        raise ValueError(f"Duplicate column names in {csv_path}: {duplicates}.")
-
-    if TARGET_COLUMN not in df.columns:
+    label_columns = [c for c in df.columns if c.startswith(LABEL_PREFIX)]
+    if not label_columns:
         raise ValueError(
-            f"Target column {TARGET_COLUMN!r} is missing from {csv_path}."
+            f"No {LABEL_PREFIX!r} columns in {csv_path}. "
+            "Regenerate the processed CSVs with preprocessing_data.py."
         )
     if df.empty:
         raise ValueError(f"Processed dataset CSV is empty: {csv_path}.")
-    if df[TARGET_COLUMN].isna().any():
-        raise ValueError(f"Missing target labels found in {csv_path}.")
 
-    y = df.pop(TARGET_COLUMN).astype(str)
-    X = df
+    Y = df[label_columns]
+    if not Y.isin([0, 1]).all().all():
+        raise ValueError(f"Labels in {csv_path} must be 0 or 1 with none missing.")
+    Y = Y.astype("int64")
+    Y.columns = [c[len(LABEL_PREFIX):] for c in label_columns]
+
+    X = df.drop(columns=label_columns)
+    X.columns = X.columns.str.lower()
+    if X.columns.duplicated().any():
+        duplicates = X.columns[X.columns.duplicated()].tolist()
+        raise ValueError(f"Duplicate column names in {csv_path}: {duplicates}.")
     if X.shape[1] == 0:
         raise ValueError(f"No feature columns found in {csv_path}.")
 
-    return X, y
+    return X, Y
 
 
-def load_train_validation(
-    dataset: str,
-) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
-    X_train, y_train = load_processed_split(dataset, "training")
-    X_validation, y_validation = load_processed_split(dataset, "validation")
+def load_splits(dataset: str) -> dict[str, tuple[pd.DataFrame, pd.DataFrame]]:
+    """Load training, validation and test, checking that their columns match."""
+    parts = {split: load_processed_split(dataset, split) for split in SPLITS}
+    X_train, Y_train = parts["training"]
 
-    if X_train.columns.tolist() != X_validation.columns.tolist():
-        raise ValueError(
-            "Training and validation CSVs must have the same feature columns "
-            "in the same order."
-        )
+    for split in ("validation", "test"):
+        X, Y = parts[split]
+        if X.columns.tolist() != X_train.columns.tolist():
+            raise ValueError(
+                f"Training and {split} CSVs must have the same feature columns "
+                "in the same order."
+            )
+        if Y.columns.tolist() != Y_train.columns.tolist():
+            raise ValueError(
+                f"Training and {split} CSVs must have the same label columns "
+                "in the same order."
+            )
 
-    return X_train, y_train, X_validation, y_validation
-
-
-def encode_labels(labels: pd.Series, class_names: list[str]) -> np.ndarray:
-    label_to_id = {name: index for index, name in enumerate(class_names)}
-    encoded = labels.map(label_to_id)
-
-    if encoded.isna().any():
-        unexpected = labels[encoded.isna()].unique().tolist()
-        raise ValueError(f"Labels outside the known classes: {unexpected}")
-
-    return encoded.to_numpy(dtype=np.int64)
+    return parts
